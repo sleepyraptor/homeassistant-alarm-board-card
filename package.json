@@ -1,6 +1,6 @@
 {
   "name": "alarm-board-card",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Home Assistant card: a board of the snapshots taken when the alarm goes off, grouped by day and event",

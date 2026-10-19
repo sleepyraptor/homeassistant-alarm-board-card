@@ -15,6 +15,10 @@ in front.
 > The photos in these screenshots are drawn, not real camera footage. Run `npm run screenshots`
 > to regenerate them.
 
+**In short:** a script saves one snapshot per camera into `My media › alarms › <date and time>__<room>__<sensor>/`
+when the alarm goes off, and this card shows those folders as a board. [Install](#installation) the card, follow the
+[five setup steps](#setup) (copy-paste YAML), add the card to a dashboard.
+
 ## Why
 
 When the alarm goes off you get a push notification with a photo. Then what?
@@ -68,9 +72,12 @@ alarms/
     └── …
 ```
 
-- `YYYY-MM-DD_HH-MM-SS` — when the alarm went off. Required.
-- `__<room>__<trigger>` — optional. The room picks which camera goes in front (see
-  [`cameras`](#cameras)); the trigger is shown next to it.
+- `YYYY-MM-DD_HH-MM-SS` — when the alarm went off, in Home Assistant's time zone (what `now()`
+  gives the script). Required. The card shows it in the time zone of your profile (*Settings →
+  Profile → Time zone*), so a phone abroad shows the right times.
+- `__<room>__<trigger>` — optional, either part may be empty. The room picks which camera goes
+  in front (see [`cameras`](#cameras)); the trigger is shown next to it. A room cannot contain
+  `__` (the script below takes care of it).
 - One image per camera, named after the camera (`.jpg`, `.jpeg`, `.png` or `.webp`). Any other
   file is ignored.
 
@@ -106,16 +113,15 @@ optionally — a notification that opens the board and a nightly clean-up.
 
 ### 1. The media folder
 
-The card reads from **My media** (the `local` media source). On disk that folder is:
+The card reads from **My media** (the `local` media source). The script has to write into the
+same folder on disk, and its path depends on how Home Assistant is set up — it is either
+**`/media`** or **`/config/media`**.
 
-| Installation | Path |
-|---|---|
-| Home Assistant OS, Supervised | `/media` |
-| Container, Core | usually `/config/media` (whatever `media_dirs: local:` points to) |
-
-Media folders are always writable by `camera.snapshot`. If a snapshot fails with
-*"no access to path"*, you are using the other path — or add yours to
-[`allowlist_external_dirs`](https://www.home-assistant.io/integrations/homeassistant/#allowlist_external_dirs).
+To find out which, run the script once (see [Try it](#try-it)) and open its trace: a step that
+failed with *"no access to path"* means it is the other one. Media folders are always writable by
+`camera.snapshot`, so nothing else needs configuring. A folder outside the media library would
+need [`allowlist_external_dirs`](https://www.home-assistant.io/integrations/homeassistant/#allowlist_external_dirs)
+and would not be visible to the card anyway.
 
 The examples below use `/media/alarms`; the card's default `folder` is `alarms`.
 
@@ -141,13 +147,14 @@ fields:
       text: {}
 sequence:
   - variables:
-      # Characters a file name cannot hold become "-".
+      # Characters a file name cannot hold become "-"; "__" separates the parts, so a run of
+      # underscores inside a name becomes a single one.
       folder: >-
         {%- set clean = '[\\/:*?"<>|]' -%}
+        {%- set r = room | default('') | regex_replace(clean, '-') | regex_replace('_{2,}', '_') -%}
+        {%- set s = trigger | default('') | regex_replace(clean, '-') | regex_replace('_{2,}', '_') -%}
         /media/alarms/{{ now().strftime('%Y-%m-%d_%H-%M-%S') -}}
-        {%- if room | default('') -%}
-          __{{ room | regex_replace(clean, '-') }}__{{ trigger | default('') | regex_replace(clean, '-') }}
-        {%- endif -%}
+        {%- if r or s -%}__{{ r }}__{{ s }}{%- endif -%}
   - action: camera.snapshot
     target:
       entity_id: camera.living_room
@@ -169,49 +176,55 @@ sequence:
 ```
 
 `continue_on_error` matters: a camera that is switched off must not stop the others. The folder
-is only created when at least one snapshot is written.
+is only created when at least one snapshot is written. Without a room or a trigger the folder gets
+the date only.
 
 ### 3. The automation
 
-The board is most useful when it knows *what* tripped the alarm. The easiest way to know is to
-trigger on the alarm's sensors while it is armed, and pass the sensor's area and name to the
-script:
+Take the snapshots **when the alarm actually goes off**, not when a sensor trips while it is
+armed — otherwise you would be photographed every time you come home during the entry delay.
+
+The alarm panel does not say which sensor tripped it, but that sensor is the one that changed
+last. Give your alarm sensors (doors, windows, motion) a label — here `alarm_sensor`, under
+**Settings → Labels** — and the automation finds it:
 
 ```yaml
-alias: Alarm snapshots on intrusion
+alias: Alarm snapshots when the alarm goes off
 mode: single
 triggers:
   - trigger: state
-    entity_id:
-      - binary_sensor.front_door
-      - binary_sensor.bedroom_window
-      - binary_sensor.living_room_motion
-    to: "on"
-conditions:
-  - condition: state
     entity_id: alarm_control_panel.home
-    state: [armed_away, armed_night, armed_vacation, pending, triggered]
+    to: triggered
 actions:
+  - variables:
+      # The alarm sensor that changed last is the one that tripped the alarm.
+      culprit: >-
+        {{ expand(label_entities('alarm_sensor'))
+           | sort(attribute='last_changed', reverse=true)
+           | map(attribute='entity_id') | first | default('') }}
   - action: script.alarm_snapshots
     data:
-      room: "{{ area_name(trigger.entity_id) or '' }}"
-      trigger: "{{ trigger.to_state.name }}"
+      room: "{{ (area_name(culprit) or '') if culprit else '' }}"
+      trigger: "{{ (state_attr(culprit, 'friendly_name') or '') if culprit else '' }}"
 ```
 
-If you would rather keep a single trigger on the alarm panel itself
-(`alarm_control_panel.home` → `triggered`), call the script without data: the folder gets the date
-only and the board shows *"Event not recorded"* instead of room and sensor.
+- The **room** is the sensor's area. A sensor with no area gives a folder with the sensor name only,
+  and no camera is put in front.
+- No labelled sensors? The script still runs; the folder gets the date only and the board shows
+  *"Event not recorded"*.
+- Prefer a list to a label? Replace `label_entities('alarm_sensor')` with
+  `['binary_sensor.front_door', 'binary_sensor.bedroom_window']`.
 
 ### 4. Optional: a notification that opens the board
 
-Put the card on a view of its own — say `/dashboard-security/alarms` — and send a notification
-that opens it when tapped:
+Put the card on a view of its own — say `/dashboard-security/alarms` — and add a notification to
+the automation of step 3, after the script, that opens it when tapped:
 
 ```yaml
   - action: notify.mobile_app_your_phone
     data:
       title: Alarm!
-      message: "{{ trigger.to_state.name }} — {{ area_name(trigger.entity_id) }}"
+      message: "{{ state_attr(culprit, 'friendly_name') if culprit else 'The alarm went off' }}"
       data:
         url: /dashboard-security/alarms          # iOS
         clickAction: /dashboard-security/alarms  # Android
@@ -257,6 +270,18 @@ mode: single
 Folders emptied by hand (the media browser can delete files but not folders) are hidden by the
 card.
 
+### Try it
+
+You do not need to set the alarm off to see the board working:
+
+1. Open the script under **Settings → Automations & scenes → Scripts**, choose **Run**, and fill
+   in a room and a trigger (any text).
+2. Check **Media → My media → alarms**: a new folder with one photo per camera.
+3. Add the card to a dashboard: the test alarm is there.
+
+Delete the test photos from the media browser afterwards; the empty folder left behind is hidden
+by the card (or removed by the clean-up of step 5).
+
 ## Configuration
 
 Add the card from the picker (**Alarm Board Card**) and use the visual editor, or write YAML.
@@ -266,7 +291,7 @@ Add the card from the picker (**Alarm Board Card**) and use the visual editor, o
 | `type` | string | — | `custom:alarm-board-card` |
 | `folder` | string | `alarms` | Folder inside **My media**, or a full `media-source://` id for another media source. |
 | `layout` | `hero` \| `grid` | `hero` | `hero`: the triggering camera large, the others beside it. `grid`: every photo the same size. |
-| `cameras` | list | — | Labels, order and rooms of the cameras. See below. |
+| `cameras` | list | — | Labels, order and rooms of the cameras. See below; the editor has a row per camera and a **Find cameras** button. |
 | `page_size` | number | `10` | Alarms loaded at first; *Show more* loads the next page. |
 | `watch_entity` | entity | — | Reload when this entity finishes running — usually the snapshot script. |
 | `title` | string | *Alarm snapshots* | Card title. Set it to `""` to hide the header. |
@@ -285,6 +310,10 @@ With it, each entry describes one image:
 | `rooms` | Rooms this camera covers. When an alarm's room matches, this camera goes in front with a red frame. A camera with no `rooms` is matched by its `name`. |
 
 Configured cameras come first, in the order you list them.
+
+In the visual editor each camera is a row (image name, label, rooms) that can be moved or
+removed. **Find cameras** reads the image names from the most recent alarm and adds the ones
+that are missing, so you only have to fill in labels and rooms.
 
 ### Full example
 
@@ -315,9 +344,10 @@ cameras:
 
 ## Troubleshooting
 
-**The board stays empty.** Open **Media → My media** and check the folder: the sub-folders must
-start with `YYYY-MM-DD_HH-MM-SS`. Anything else is ignored on purpose, so a shared media folder
-can hold other things.
+**The board stays empty.** The empty board says where it is looking (*Looking in My media ›
+alarms*): open that folder under **Media** and check that it exists and that its sub-folders start
+with `YYYY-MM-DD_HH-MM-SS`. Anything else is ignored on purpose, so a shared media folder can hold
+other things.
 
 **`no access to path` in the script's trace.** The path is not your media folder; see
 [step 1](#1-the-media-folder).

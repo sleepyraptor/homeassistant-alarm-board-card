@@ -158,7 +158,12 @@ test("bad configs are rejected with a clear message", async () => {
   const el = globalThis.document.createElement("alarm-board-card");
   assert.throws(() => el.setConfig({ layout: "wall" }), /hero.*grid/);
   assert.throws(() => el.setConfig({ cameras: { file: "x" } }), /list/);
-  assert.throws(() => el.setConfig({ cameras: [{ name: "no file" }] }), /list/);
+  assert.throws(() => el.setConfig({ cameras: ["living_room"] }), /list/);
+});
+
+test("a camera row without a file (just added in the editor) is skipped, not an error", async () => {
+  const { normalise } = await boot();
+  assert.deepEqual(normalise({ cameras: [{ file: "" }, { file: "desk" }] }).cameras.map((c) => c.file), ["desk"]);
 });
 
 test("rooms can be a single string", async () => {
@@ -217,4 +222,47 @@ test("tap opens the lightbox and double tap zooms in and out", async () => {
   assert.match(img.style.transform, /scale\(1\)/);
   host.shadowRoot.querySelector(".x").click();
   assert.ok(!host.isConnected);
+});
+
+test("a sensor without an area still shows its name", async () => {
+  const el = await makeCard({}, fakeHass({ alarms: { "2026-10-19_15-09-58____Motion bedroom": CAMS } }));
+  const what = all(el, ".what")[0];
+  assert.equal(what.textContent, "Motion bedroom");
+  assert.ok(!what.classList.contains("none"));
+});
+
+test("the empty board says where it is looking", async () => {
+  const { where } = await boot();
+  assert.equal(where("alarms"), "My media › alarms");
+  assert.equal(where("cctv/alarms"), "My media › cctv › alarms");
+  assert.equal(where("allarmi", "it"), "I miei media › allarmi");
+  const el = await makeCard({ folder: "wrong" }, fakeHass({}));
+  assert.match(el.shadowRoot.textContent, /Looking in My media › wrong/);
+});
+
+test("folder times are read in Home Assistant's time zone, whatever the browser's", async () => {
+  const { parseEvent, zoned } = await boot();
+  assert.equal(parseEvent("2026-10-19_15-09-58", "Asia/Tokyo").date.toISOString(), "2026-10-19T06:09:58.000Z");
+  assert.equal(zoned(2026, 7, 1, 12, 0, 0, "Europe/Rome").toISOString(), "2026-07-01T10:00:00.000Z");
+  // Winter time, one day after the clocks went back.
+  assert.equal(zoned(2026, 10, 26, 12, 0, 0, "Europe/Rome").toISOString(), "2026-10-26T11:00:00.000Z");
+  assert.equal(zoned(2026, 1, 15, 8, 30, 0, "America/New_York").toISOString(), "2026-01-15T13:30:00.000Z");
+});
+
+test("times and days follow the zone the user picked in their profile", async () => {
+  const { time, dayLabel } = await boot();
+  const at = new Date("2026-10-19T22:30:00Z");
+  assert.match(time(at, "en-GB", "Asia/Tokyo"), /^07:30:00/);
+  assert.match(time(at, "en-GB", "Europe/Rome"), /^00:30:00/);
+  // 00:30 in Rome on the 20th is still the 19th in New York.
+  const now = new Date("2026-10-20T08:00:00Z");
+  assert.equal(dayLabel(at, now, "en", "en", "Europe/Rome"), "Today");
+  assert.equal(dayLabel(at, now, "en", "en", "America/New_York"), "Yesterday");
+});
+
+test("the card uses the server zone for names and the profile zone for display", async () => {
+  const tree = { alarms: { "2026-10-19_15-09-58__Hall__Door": CAMS } };
+  const hass = { ...fakeHass(tree), config: { time_zone: "Asia/Tokyo" }, locale: { language: "en-GB", time_zone: "server" } };
+  const el = await makeCard({}, hass);
+  assert.match(all(el, ".hour")[0].textContent, /^15:09:58/);
 });

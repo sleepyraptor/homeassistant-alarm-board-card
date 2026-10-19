@@ -5,7 +5,7 @@
  * Photos are served through signed URLs (media_source/resolve_media), so they stay behind the login.
  * https://github.com/sleepyraptor/homeassistant-alarm-board-card
  */
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 const LOCAL = "media-source://media_source/local";
 const NAME = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:__(.*?)__(.*))?$/;
@@ -21,6 +21,8 @@ const I18N = {
     today: "Today",
     yesterday: "Yesterday",
     empty: "No alarms recorded",
+    where: "Looking in {folder}",
+    my_media: "My media",
     loading: "Loading…",
     loading_photos: "Loading photos…",
     more: "Show more ({n})",
@@ -45,13 +47,28 @@ const I18N = {
     f_watch_entity: "Refresh when this entity changes",
     h_watch_entity: "Usually the script that takes the snapshots",
     f_cameras: "Cameras",
-    h_cameras: "List of { file, name, rooms }: image name without extension, label, rooms it covers"
+    h_cameras: "Optional. Without cameras every photo is shown, labelled after its file name, and none is put in front.",
+    f_file: "Image name",
+    h_file: "File name without extension, e.g. living_room",
+    f_name: "Label",
+    f_rooms: "Rooms it covers",
+    h_rooms: "When an alarm comes from one of these rooms, this camera goes in front",
+    camera_n: "Camera {n}",
+    add_camera: "Add camera",
+    detect: "Find cameras",
+    detect_found: "{n} cameras in the latest alarm, {added} added",
+    detect_none: "No alarm found in {folder}",
+    up: "Move up",
+    down: "Move down",
+    remove: "Remove"
   },
   it: {
     title: "Foto degli allarmi",
     today: "Oggi",
     yesterday: "Ieri",
     empty: "Nessun allarme registrato",
+    where: "Cerco in {folder}",
+    my_media: "I miei media",
     loading: "Carico…",
     loading_photos: "Carico le foto…",
     more: "Mostra altri ({n})",
@@ -76,7 +93,20 @@ const I18N = {
     f_watch_entity: "Aggiorna quando cambia questa entità",
     h_watch_entity: "Di solito lo script che scatta le foto",
     f_cameras: "Camere",
-    h_cameras: "Lista di { file, name, rooms }: nome dell'immagine senza estensione, etichetta, stanze inquadrate"
+    h_cameras: "Facoltativo. Senza camere si vedono tutte le foto, con il nome del file, e nessuna messa in evidenza.",
+    f_file: "Nome dell'immagine",
+    h_file: "Nome del file senza estensione, es. soggiorno",
+    f_name: "Etichetta",
+    f_rooms: "Stanze inquadrate",
+    h_rooms: "Se l'allarme arriva da una di queste stanze, questa camera va in evidenza",
+    camera_n: "Camera {n}",
+    add_camera: "Aggiungi camera",
+    detect: "Trova camere",
+    detect_found: "{n} camere nell'ultimo allarme, {added} aggiunte",
+    detect_none: "Nessun allarme trovato in {folder}",
+    up: "Sposta su",
+    down: "Sposta giù",
+    remove: "Rimuovi"
   }
 };
 
@@ -89,13 +119,44 @@ export const langOf = (hass) => {
 export const t = (lang, key, vars = {}) =>
   String((I18N[lang] || I18N.en)[key] ?? I18N.en[key] ?? key).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
 
+/** Wall-clock fields of an instant in a time zone (the browser's when tz is empty). */
+const fields = (date, tz) => {
+  if (!tz) {
+    return { y: date.getFullYear(), m: date.getMonth() + 1, d: date.getDate(), h: date.getHours(), mi: date.getMinutes(), s: date.getSeconds() };
+  }
+  const o = {};
+  const f = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric",
+    hour: "numeric", minute: "numeric", second: "numeric"
+  });
+  for (const p of f.formatToParts(date)) o[p.type] = +p.value;
+  return { y: o.year, m: o.month, d: o.day, h: o.hour % 24, mi: o.minute, s: o.second };
+};
+
+/**
+ * The instant at which the clock in time zone tz reads the given wall-clock time.
+ * The folder name is written by Home Assistant in its own time zone, which is not
+ * necessarily the browser's (a phone abroad, a laptop set to UTC).
+ */
+export const zoned = (y, mo, d, h, mi, s, tz) => {
+  if (!tz) return new Date(y, mo - 1, d, h, mi, s);
+  const want = Date.UTC(y, mo - 1, d, h, mi, s);
+  let at = want;
+  // Two rounds settle the offset, daylight-saving changes included.
+  for (let i = 0; i < 2; i++) {
+    const f = fields(new Date(at), tz);
+    at += want - Date.UTC(f.y, f.m - 1, f.d, f.h, f.mi, f.s);
+  }
+  return new Date(at);
+};
+
 /** The folder name is the only source of metadata: date, room and triggering sensor. */
-export const parseEvent = (title) => {
+export const parseEvent = (title, tz) => {
   const m = NAME.exec(String(title ?? ""));
   if (!m) return null;
   const [, y, mo, d, h, mi, s, room, sensor] = m;
   return {
-    date: new Date(+y, +mo - 1, +d, +h, +mi, +s),
+    date: zoned(+y, +mo, +d, +h, +mi, +s, tz),
     room: room || "",
     sensor: sensor || ""
   };
@@ -108,16 +169,27 @@ export const folderId = (folder) => {
   return `${LOCAL}/${f.replace(/^\/+|\/+$/g, "")}`;
 };
 
-const sameDay = (a, b) =>
-  a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+/** The folder as a person finds it in the media browser. */
+export const where = (folder, lang = "en") => {
+  const id = folderId(folder);
+  if (!id.startsWith(`${LOCAL}/`)) return id;
+  return [t(lang, "my_media"), ...id.slice(LOCAL.length + 1).split("/")].join(" › ");
+};
 
-export const dayLabel = (date, now = new Date(), lang = "en", locale = lang) => {
-  if (sameDay(date, now)) return t(lang, "today");
-  const y = new Date(now);
-  y.setDate(now.getDate() - 1);
-  if (sameDay(date, y)) return t(lang, "yesterday");
+/** Calendar day of an instant in a time zone, as a comparable number. */
+const dayNo = (date, tz) => {
+  const f = fields(date, tz);
+  return Date.UTC(f.y, f.m - 1, f.d) / 86400000;
+};
+
+/** Today, Yesterday, or the date — counted in the time zone the times are shown in. */
+export const dayLabel = (date, now = new Date(), lang = "en", locale = lang, tz) => {
+  const diff = dayNo(now, tz) - dayNo(date, tz);
+  if (diff === 0) return t(lang, "today");
+  if (diff === 1) return t(lang, "yesterday");
   const opts = { weekday: "short", day: "numeric", month: "short" };
-  if (date.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+  if (fields(date, tz).y !== fields(now, tz).y) opts.year = "numeric";
+  if (tz) opts.timeZone = tz;
   return date.toLocaleDateString(locale, opts);
 };
 
@@ -131,7 +203,8 @@ export const ago = (date, now = new Date(), locale = "en") => {
   return rtf.format(Math.round(s / 86400), "day");
 };
 
-const time = (d, locale) => d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+export const time = (d, locale, tz) =>
+  d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", ...(tz ? { timeZone: tz } : {}) });
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
@@ -250,6 +323,7 @@ ha-card{padding:12px 12px 4px;container-type:inline-size;overflow:hidden}
   background:none;color:var(--primary-color);font:inherit;font-weight:600;cursor:pointer}
 .msg{padding:28px 8px;text-align:center;color:var(--secondary-text-color)}
 .msg ha-icon{display:block;margin:0 auto 8px;--mdc-icon-size:40px;opacity:.6}
+.msg .where{margin-top:6px;font-size:12px;opacity:.75}
 `;
 
 /** The lightbox lives in <body>: an ancestor with a transform would break position:fixed. */
@@ -281,10 +355,12 @@ export const normalise = (config) => {
   const c = config || {};
   const layout = c.layout ?? "hero";
   if (!["hero", "grid"].includes(layout)) throw new Error(t("en", "bad_layout"));
-  const cams = c.cameras ?? [];
-  if (!Array.isArray(cams) || cams.some((x) => !x || typeof x !== "object" || !x.file)) {
+  const all = c.cameras ?? [];
+  if (!Array.isArray(all) || all.some((x) => !x || typeof x !== "object")) {
     throw new Error(t("en", "bad_cameras"));
   }
+  // A row just added in the editor has no file yet: it is skipped, not an error.
+  const cams = all.filter((x) => String(x.file ?? "").trim());
   const size = parseInt(c.page_size, 10);
   return {
     ...c,
@@ -329,6 +405,17 @@ class AlarmBoardCard extends HTMLElement {
 
   get _lang() {
     return langOf(this._hass);
+  }
+
+  /** Home Assistant's own time zone: the one the folder names are written in. */
+  get _serverTz() {
+    return (this._hass && this._hass.config && this._hass.config.time_zone) || undefined;
+  }
+
+  /** The time zone the user chose in their profile: the browser's (default) or the server's. */
+  get _tz() {
+    const pref = this._hass && this._hass.locale && this._hass.locale.time_zone;
+    return pref === "server" ? this._serverTz : undefined;
   }
 
   get _locale() {
@@ -385,7 +472,7 @@ class AlarmBoardCard extends HTMLElement {
       const root = await this._browse(folderId(this._config.folder));
       const dirs = (root.children || [])
         .filter((c) => c.media_class === "directory" || c.can_expand)
-        .map((c) => ({ id: c.media_content_id, title: c.title, info: parseEvent(c.title) }))
+        .map((c) => ({ id: c.media_content_id, title: c.title, info: parseEvent(c.title, this._serverTz) }))
         .filter((c) => c.info)
         .sort((a, b) => b.info.date - a.info.date);
       const known = new Map(this._events.map((e) => [e.id, e]));
@@ -450,8 +537,9 @@ class AlarmBoardCard extends HTMLElement {
   _event(e, ei) {
     const L = this._lang;
     const { date, room, sensor } = e.info;
-    const what = room
-      ? `<div class="what">${esc(room)}${sensor ? `<span class="sep">·</span>${esc(sensor)}` : ""}</div>`
+    const parts = [room, sensor].filter(Boolean).map(esc);
+    const what = parts.length
+      ? `<div class="what">${parts.join(`<span class="sep">·</span>`)}</div>`
       : `<div class="what none">${esc(t(L, "unknown_event"))}</div>`;
     let body;
     if (!e.photos) body = `<div class="msg">${esc(t(L, "loading_photos"))}</div>`;
@@ -461,7 +549,7 @@ class AlarmBoardCard extends HTMLElement {
     }
     return `<article class="ev">
       <div class="head"><div class="badge"><ha-icon icon="mdi:alarm-light"></ha-icon></div>
-        <div class="txt"><div class="when"><span class="hour">${time(date, this._locale)}</span><span class="rel">${esc(ago(date, new Date(), this._locale))}</span></div>${what}</div>
+        <div class="txt"><div class="when"><span class="hour">${time(date, this._locale, this._tz)}</span><span class="rel">${esc(ago(date, new Date(), this._locale))}</span></div>${what}</div>
       </div>${body}</article>`;
   }
 
@@ -474,7 +562,7 @@ class AlarmBoardCard extends HTMLElement {
     let html = "";
     let day = "";
     list.forEach((e, ei) => {
-      const d = dayLabel(e.info.date, new Date(), L, this._locale);
+      const d = dayLabel(e.info.date, new Date(), L, this._locale, this._tz);
       if (d !== day) {
         html += `<div class="day">${esc(d)}</div>`;
         day = d;
@@ -486,7 +574,8 @@ class AlarmBoardCard extends HTMLElement {
     else if (!this._events.length) {
       tail = this._loading
         ? `<div class="msg">${esc(t(L, "loading"))}</div>`
-        : `<div class="msg"><ha-icon icon="mdi:shield-check-outline"></ha-icon>${esc(t(L, "empty"))}</div>`;
+        : `<div class="msg"><ha-icon icon="mdi:shield-check-outline"></ha-icon>${esc(t(L, "empty"))}
+          <div class="where">${esc(t(L, "where", { folder: where(c.folder, L) }))}</div></div>`;
     } else if (this._events.length > this._shown) {
       tail = `<button class="more" id="more">${esc(t(L, "more", { n: this._events.length - this._shown }))}</button>`;
     }
@@ -522,13 +611,14 @@ class AlarmBoardCard extends HTMLElement {
     if (!e || !e.photos) return;
     const L = this._lang;
     const locale = this._locale;
+    const tz = this._tz;
     const photos = e.photos.filter((p) => p.url);
     let i = Math.max(0, photos.indexOf(e.photos[pi]));
     const host = document.createElement("div");
     host.className = "alarm-board-lightbox";
     const root = host.attachShadow({ mode: "open" });
     const { date, room, sensor } = e.info;
-    const sub = room ? `${esc(room)}${sensor ? ` · ${esc(sensor)}` : ""}` : esc(t(L, "unknown_event"));
+    const sub = [room, sensor].filter(Boolean).map(esc).join(" · ") || esc(t(L, "unknown_event"));
     // Home-made zoom: the Home Assistant app disables page pinch-zoom, so the lightbox handles it.
     let z = { s: 1, x: 0, y: 0 };
     let img = null;
@@ -563,7 +653,7 @@ class AlarmBoardCard extends HTMLElement {
       z = { s: 1, x: 0, y: 0 };
       root.innerHTML = `<style>${BOX_CSS}</style><div class="box" role="dialog" aria-modal="true">
         <div class="bar"><div class="t"><b>${esc(p.label)}</b>${p.trigger ? ` · ${esc(t(L, "trigger"))}` : ""}<br>
-          <span>${esc(dayLabel(date, new Date(), L, locale))} ${time(date, locale)} · ${sub}</span></div>
+          <span>${esc(dayLabel(date, new Date(), L, locale, tz))} ${time(date, locale, tz)} · ${sub}</span></div>
           <button class="x" aria-label="${esc(t(L, "close"))}">×</button></div>
         <div class="stage">${photos.length > 1 ? `<button class="nav prev" aria-label="${esc(t(L, "previous"))}">‹</button>` : ""}
           <img src="${esc(p.url)}" alt="${esc(p.label)}" draggable="false">
@@ -679,20 +769,58 @@ class AlarmBoardCard extends HTMLElement {
   }
 }
 
-/** Visual editor: every option has a field; cameras are edited as YAML inside the form. */
+/**
+ * Visual editor: every option has a field. Cameras get rows of their own, with add, remove,
+ * reorder, and a button that reads them from the latest alarm folder.
+ */
+const EDITOR_CSS = `
+.cams{margin-top:20px}
+.cams .head{font-weight:500;margin:0 0 4px}
+.cams .help{font-size:12px;color:var(--secondary-text-color);margin:0 0 10px}
+.cam{border:1px solid var(--divider-color);border-radius:12px;padding:10px 10px 4px;margin:0 0 10px}
+.cam .bar{display:flex;align-items:center;gap:4px;margin:0 0 6px;font-size:13px;color:var(--secondary-text-color)}
+.cam .bar span{flex:1}
+.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ed-btn{border:1px solid var(--divider-color);background:none;color:var(--primary-color);border-radius:18px;
+  padding:6px 14px;font:inherit;font-weight:500;cursor:pointer}
+.ed-btn:disabled{opacity:.4;cursor:default}
+.icon-btn{border:0;background:none;color:var(--secondary-text-color);width:32px;height:32px;border-radius:50%;
+  font-size:16px;cursor:pointer}
+.icon-btn:hover{background:var(--secondary-background-color)}
+.icon-btn:disabled{opacity:.3;cursor:default}
+.note{font-size:12px;color:var(--secondary-text-color)}
+`;
+
 class AlarmBoardCardEditor extends HTMLElement {
   setConfig(config) {
+    // Home Assistant hands back the config this editor just emitted: nothing to redraw.
+    if (this._built && JSON.stringify(config) === this._sent) {
+      this._config = { ...config };
+      return;
+    }
+    const before = this._config;
     this._config = { ...config };
-    this._render();
+    // Rows are rebuilt only when the list itself changed, not on every keystroke.
+    const shape = (c) => JSON.stringify(((c && c.cameras) || []).map((x) => x.file));
+    if (!this._built || shape(before) !== shape(this._config)) this._render();
+    else this._refresh();
   }
 
   set hass(hass) {
     this._hass = hass;
-    if (this._form) this._form.hass = hass;
-    else this._render();
+    if (!this._built) this._render();
+    else for (const f of this.querySelectorAll("ha-form")) f.hass = hass;
   }
 
-  _schema(L) {
+  get _L() {
+    return langOf(this._hass);
+  }
+
+  get _cameras() {
+    return Array.isArray(this._config.cameras) ? this._config.cameras : [];
+  }
+
+  _mainSchema(L) {
     return [
       { name: "title", selector: { text: {} } },
       { name: "folder", selector: { text: {} } },
@@ -715,34 +843,138 @@ class AlarmBoardCardEditor extends HTMLElement {
           { name: "page_size", selector: { number: { min: 1, max: 50, mode: "box" } } }
         ]
       },
-      { name: "watch_entity", selector: { entity: { domain: ["script", "automation", "input_button", "button"] } } },
-      { name: "cameras", selector: { object: {} } }
+      { name: "watch_entity", selector: { entity: { domain: ["script", "automation", "input_button", "button"] } } }
     ];
+  }
+
+  _camSchema() {
+    return [
+      {
+        type: "grid",
+        name: "",
+        schema: [
+          { name: "file", required: true, selector: { text: {} } },
+          { name: "name", selector: { text: {} } }
+        ]
+      },
+      { name: "rooms", selector: { text: { multiple: true } } }
+    ];
+  }
+
+  _form(schema, data, onChange) {
+    const L = this._L;
+    const f = document.createElement("ha-form");
+    f.hass = this._hass;
+    f.schema = schema;
+    f.data = data;
+    f.computeLabel = (s) => t(L, `f_${s.name}`);
+    f.computeHelper = (s) => {
+      const h = t(L, `h_${s.name}`);
+      return h === `h_${s.name}` ? undefined : h;
+    };
+    f.addEventListener("value-changed", (ev) => {
+      ev.stopPropagation();
+      onChange(ev.detail.value);
+    });
+    return f;
+  }
+
+  _emit(config) {
+    const out = { ...config };
+    for (const k of Object.keys(out)) {
+      if (out[k] === "" || out[k] === undefined || out[k] === null) delete out[k];
+    }
+    if (Array.isArray(out.cameras)) {
+      out.cameras = out.cameras.map((c) => {
+        const x = { file: c.file || "" };
+        if (c.name) x.name = c.name;
+        const rooms = (c.rooms || []).filter((r) => String(r).trim());
+        if (rooms.length) x.rooms = rooms;
+        return x;
+      });
+      if (!out.cameras.length) delete out.cameras;
+    }
+    this._config = out;
+    this._sent = JSON.stringify(out);
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: out }, bubbles: true, composed: true }));
+  }
+
+  _setCameras(cams, rebuild = true) {
+    this._emit({ ...this._config, cameras: cams });
+    if (rebuild) this._render();
   }
 
   _render() {
     if (!this._config) return;
-    const L = langOf(this._hass);
-    if (!this._form) {
-      this._form = document.createElement("ha-form");
-      this._form.computeLabel = (s) => t(L, `f_${s.name}`);
-      this._form.computeHelper = (s) => {
-        const h = t(L, `h_${s.name}`);
-        return h === `h_${s.name}` ? undefined : h;
+    this._built = true;
+    const L = this._L;
+    const cams = this._cameras;
+    this.innerHTML = `<style>${EDITOR_CSS}</style><div class="main"></div>
+      <div class="cams"><div class="head">${esc(t(L, "f_cameras"))}</div>
+        <div class="help">${esc(t(L, "h_cameras"))}</div><div class="list"></div>
+        <div class="tools"><button class="ed-btn add" type="button">${esc(t(L, "add_camera"))}</button>
+          <button class="ed-btn detect" type="button">${esc(t(L, "detect"))}</button>
+          <span class="note"></span></div></div>`;
+    this._main = this._form(this._mainSchema(L), { layout: "hero", page_size: 10, ...this._config }, (v) => {
+      this._emit({ ...v, cameras: this._config.cameras });
+    });
+    this.querySelector(".main").appendChild(this._main);
+
+    const list = this.querySelector(".list");
+    cams.forEach((cam, i) => {
+      const row = document.createElement("div");
+      row.className = "cam";
+      row.innerHTML = `<div class="bar"><span>${esc(t(L, "camera_n", { n: i + 1 }))}</span>
+        <button class="icon-btn up" type="button" aria-label="${esc(t(L, "up"))}" ${i === 0 ? "disabled" : ""}>↑</button>
+        <button class="icon-btn down" type="button" aria-label="${esc(t(L, "down"))}" ${i === cams.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="icon-btn remove" type="button" aria-label="${esc(t(L, "remove"))}">✕</button></div>`;
+      row.appendChild(this._form(this._camSchema(), { rooms: [], ...cam }, (v) => {
+        const next = this._cameras.slice();
+        next[i] = v;
+        // A new file name changes the list's shape, but the row must keep its focus.
+        this._setCameras(next, false);
+      }));
+      const move = (d) => {
+        const next = this._cameras.slice();
+        [next[i], next[i + d]] = [next[i + d], next[i]];
+        this._setCameras(next);
       };
-      this._form.addEventListener("value-changed", (ev) => {
-        const value = { ...ev.detail.value };
-        for (const k of Object.keys(value)) {
-          if (value[k] === "" || value[k] === undefined || value[k] === null) delete value[k];
-        }
-        this._config = value;
-        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: value }, bubbles: true, composed: true }));
-      });
-      this.appendChild(this._form);
+      row.querySelector(".up").addEventListener("click", () => move(-1));
+      row.querySelector(".down").addEventListener("click", () => move(1));
+      row.querySelector(".remove").addEventListener("click", () => this._setCameras(this._cameras.filter((_, k) => k !== i)));
+      list.appendChild(row);
+    });
+    this.querySelector(".add").addEventListener("click", () => this._setCameras([...this._cameras, { file: "" }]));
+    const detect = this.querySelector(".detect");
+    detect.disabled = !this._hass || !this._hass.callWS;
+    detect.addEventListener("click", () => this._detect());
+  }
+
+  _refresh() {
+    if (this._main) this._main.data = { layout: "hero", page_size: 10, ...this._config };
+  }
+
+  /** Reads the camera names from the most recent alarm folder and adds the missing ones. */
+  async _detect() {
+    const L = this._L;
+    const note = this.querySelector(".note");
+    const folder = this._config.folder || "alarms";
+    try {
+      const root = await this._hass.callWS({ type: "media_source/browse_media", media_content_id: folderId(folder) });
+      const latest = (root.children || [])
+        .map((c) => ({ c, info: parseEvent(c.title) }))
+        .filter((x) => x.info)
+        .sort((a, b) => b.info.date - a.info.date)[0];
+      if (!latest) throw new Error("empty");
+      const dir = await this._hass.callWS({ type: "media_source/browse_media", media_content_id: latest.c.media_content_id });
+      const files = (dir.children || []).filter((c) => IMAGE.test(c.title)).map((c) => c.title.replace(/\.[^.]+$/, ""));
+      const have = new Set(this._cameras.map((c) => String(c.file).toLowerCase()));
+      const added = files.filter((f) => !have.has(f.toLowerCase())).map((f) => ({ file: f, name: pretty(f) }));
+      this._setCameras([...this._cameras, ...added]);
+      this.querySelector(".note").textContent = t(L, "detect_found", { n: files.length, added: added.length });
+    } catch {
+      note.textContent = t(L, "detect_none", { folder: where(folder, L) });
     }
-    this._form.hass = this._hass;
-    this._form.schema = this._schema(L);
-    this._form.data = { layout: "hero", page_size: 10, ...this._config };
   }
 }
 
