@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Alarm Board Card — demo</title>
+  <style>
+    /* Home Assistant's default themes, the variables the card reads. */
+    :root, [data-theme="light"] {
+      --primary-background-color: #fafafa;
+      --card-background-color: #ffffff;
+      --ha-card-background: #ffffff;
+      --secondary-background-color: #f2f2f4;
+      --primary-text-color: #212121;
+      --secondary-text-color: #727272;
+      --divider-color: rgba(0, 0, 0, 0.12);
+      --primary-color: #03a9f4;
+      --red-color: #f44336;
+      --rgb-red-color: 244, 67, 54;
+    }
+    [data-theme="dark"] {
+      --primary-background-color: #111111;
+      --card-background-color: #1c1c1c;
+      --ha-card-background: #1c1c1c;
+      --secondary-background-color: #262626;
+      --primary-text-color: #e1e1e1;
+      --secondary-text-color: #9b9b9b;
+      --divider-color: rgba(225, 225, 225, 0.12);
+    }
+    html, body { margin: 0; background: var(--primary-background-color); }
+    body { font-family: Roboto, "Segoe UI", system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+    #stage { padding: 16px; box-sizing: border-box; margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <script type="module" src="./demo.js"></script>
+</body>
+</html>
